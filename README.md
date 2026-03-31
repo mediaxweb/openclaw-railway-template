@@ -11,14 +11,63 @@
 - **OpenClaw Gateway + Control UI** (served at `/` and `/openclaw`)
 - A friendly **Setup Wizard** at `/setup` (protected by a password)
 - Optional **Web Terminal** at `/tui` for browser-based TUI access
+- Optional **Bearer-protected Chat API** at `POST /api/chat`
 - Persistent state via **Railway Volume** (so config/credentials/memory survive redeploys)
 
 ## How it works (high level)
 
 - The container runs a wrapper web server.
 - The wrapper protects `/setup` with `SETUP_PASSWORD`.
+- If `CHAT_API_KEY` is set, the wrapper also exposes `POST /api/chat` and forwards it to the local OpenClaw `v1/chat/completions` endpoint with a separate Bearer key.
 - During setup, the wrapper runs `openclaw onboard --non-interactive ...` inside the container, writes state to the volume, and then starts the gateway.
 - After setup, **`/` is OpenClaw**. The wrapper reverse-proxies all traffic (including WebSockets) to the local gateway process.
+
+## Chat API
+
+The template can expose a dedicated `POST /api/chat` route for server-to-server chat access.
+
+### Why use this instead of exposing `/v1/chat/completions` directly?
+
+- `POST /api/chat` is protected by a separate `CHAT_API_KEY`
+- The wrapper forwards requests to the internal gateway using the private gateway token
+- Public requests to raw `/v1/*` are blocked by the wrapper, so you are not exposing the full OpenClaw operator API surface
+
+### Enabling
+
+Set these Railway Variables:
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `CHAT_API_KEY` | Yes | _(empty)_ | Bearer token required by `POST /api/chat` |
+| `CHAT_API_DEFAULT_MODEL` | No | `openclaw` | Used when the request omits `model` |
+| `CHAT_API_DEFAULT_AGENT_ID` | No | `main` | Sent to the internal gateway as `x-openclaw-agent-id` |
+
+Redeploy after setting the variables. If the instance is already configured, the wrapper enables the internal OpenClaw chat-completions endpoint at boot.
+
+### Request format
+
+`POST /api/chat` accepts an OpenAI-style chat completions payload and forwards it internally to `v1/chat/completions`.
+
+Example:
+
+```bash
+curl https://your-app.up.railway.app/api/chat \
+  -H "Authorization: Bearer $CHAT_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      { "role": "user", "content": "Reply with exactly: pong" }
+    ],
+    "stream": false
+  }'
+```
+
+Optional wrapper-only fields:
+
+- `agentId`: overrides `CHAT_API_DEFAULT_AGENT_ID`
+- `sessionKey`: forwarded as `x-openclaw-session-key`
+
+The wrapper removes those two fields before sending the request upstream.
 
 ## Getting chat tokens (so you don't have to scramble)
 
@@ -75,6 +124,7 @@ docker build -t openclaw-railway-template .
 docker run --rm -p 8080:8080 \
   -e PORT=8080 \
   -e SETUP_PASSWORD=test \
+  -e CHAT_API_KEY=dev-chat-key \
   -e ENABLE_WEB_TUI=true \
   -e OPENCLAW_STATE_DIR=/data/.openclaw \
   -e OPENCLAW_WORKSPACE_DIR=/data/workspace \
@@ -83,6 +133,7 @@ docker run --rm -p 8080:8080 \
 
 # Setup wizard: http://localhost:8080/setup (password: test)
 # Web terminal: http://localhost:8080/tui (after setup)
+# Chat API: curl http://localhost:8080/api/chat -H "Authorization: Bearer dev-chat-key" ...
 ```
 
 ## FAQ
@@ -116,6 +167,10 @@ openclaw models set provider/model-id
 ```
 
 For example: `openclaw models set anthropic/claude-sonnet-4-20250514` or `openclaw models set openai/gpt-4-turbo`. Use `openclaw models list --all` to see available models.
+
+**Q: How do I call the chat API from my backend?**
+
+A: Set `CHAT_API_KEY` in Railway, redeploy, then send a `POST` request to `/api/chat` with `Authorization: Bearer <CHAT_API_KEY>`. The request body uses the OpenAI-style chat completions format with `messages`, `model`, and `stream`.
 
 **Q: How do I access configuration after the initial setup?**
 
