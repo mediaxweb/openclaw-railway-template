@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 
 import express from "express";
 import httpProxy from "http-proxy";
@@ -18,6 +19,11 @@ const WORKSPACE_DIR =
   path.join(STATE_DIR, "workspace");
 
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
+const CHAT_API_KEY = process.env.CHAT_API_KEY?.trim();
+const CHAT_API_DEFAULT_MODEL =
+  process.env.CHAT_API_DEFAULT_MODEL?.trim() || "openclaw";
+const CHAT_API_DEFAULT_AGENT_ID =
+  process.env.CHAT_API_DEFAULT_AGENT_ID?.trim() || "main";
 
 const LOG_FILE = path.join(STATE_DIR, "server.log");
 const LOG_RING_BUFFER_MAX = 1000;
@@ -67,6 +73,13 @@ const log = {
   warn: (category, message) => writeLog("WARN", category, message),
   error: (category, message) => writeLog("ERROR", category, message),
 };
+
+function secretsEqual(actual, expected) {
+  if (!actual || !expected) return false;
+  const actualHash = crypto.createHash("sha256").update(actual).digest();
+  const expectedHash = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(actualHash, expectedHash);
+}
 
 function resolveGatewayToken() {
   const envTok = process.env.OPENCLAW_GATEWAY_TOKEN?.trim();
@@ -177,6 +190,33 @@ async function syncAllowedOrigins() {
   } else {
     log.warn("gateway", `failed to set allowedOrigins (exit=${result.code})`);
   }
+}
+
+async function syncChatCompletionsEndpoint() {
+  if (!CHAT_API_KEY || !isConfigured()) {
+    return { code: 0, skipped: true, output: "" };
+  }
+
+  const result = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs([
+      "config",
+      "set",
+      "gateway.http.endpoints.chatCompletions.enabled",
+      "true",
+    ]),
+  );
+
+  if (result.code === 0) {
+    log.info("chat-api", "enabled gateway.http.endpoints.chatCompletions.enabled");
+  } else {
+    log.warn(
+      "chat-api",
+      `failed to enable chatCompletions endpoint (exit=${result.code})`,
+    );
+  }
+
+  return result;
 }
 
 let gatewayProc = null;
@@ -409,14 +449,126 @@ function requireSetupAuth(req, res, next) {
   const decoded = Buffer.from(encoded, "base64").toString("utf8");
   const idx = decoded.indexOf(":");
   const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
-  const isValid = crypto.timingSafeEqual(passwordHash, expectedHash);
+  const isValid = secretsEqual(password, SETUP_PASSWORD);
   if (!isValid) {
     res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
     return res.status(401).send("Invalid password");
   }
   return next();
+}
+
+function getChatApiKey(req) {
+  const authHeader = req.headers.authorization || "";
+  const [scheme, token] = authHeader.split(" ");
+  if (scheme === "Bearer" && token?.trim()) {
+    return token.trim();
+  }
+  const headerKey = req.headers["x-api-key"];
+  return typeof headerKey === "string" ? headerKey.trim() : "";
+}
+
+function requireChatApiAuth(req, res, next) {
+  if (!CHAT_API_KEY) {
+    return res.status(503).json({
+      error: { message: "CHAT_API_KEY is not configured on this instance." },
+    });
+  }
+
+  const apiKey = getChatApiKey(req);
+  if (!secretsEqual(apiKey, CHAT_API_KEY)) {
+    return res.status(401).json({
+      error: { message: "Unauthorized" },
+    });
+  }
+
+  return next();
+}
+
+function validateChatApiPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return "Invalid body: expected a JSON object.";
+  }
+
+  if (!Array.isArray(payload.messages) || payload.messages.length === 0) {
+    return "Invalid messages: expected a non-empty array.";
+  }
+
+  if (payload.model !== undefined && typeof payload.model !== "string") {
+    return "Invalid model: must be a string.";
+  }
+
+  if (payload.stream !== undefined && typeof payload.stream !== "boolean") {
+    return "Invalid stream: must be a boolean.";
+  }
+
+  if (payload.agentId !== undefined && typeof payload.agentId !== "string") {
+    return "Invalid agentId: must be a string.";
+  }
+
+  if (
+    payload.sessionKey !== undefined &&
+    typeof payload.sessionKey !== "string"
+  ) {
+    return "Invalid sessionKey: must be a string.";
+  }
+
+  for (const [index, message] of payload.messages.entries()) {
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      return `Invalid messages[${index}]: must be an object.`;
+    }
+    if (typeof message.role !== "string") {
+      return `Invalid messages[${index}].role: must be a string.`;
+    }
+    if (
+      typeof message.content !== "string" &&
+      !Array.isArray(message.content)
+    ) {
+      return `Invalid messages[${index}].content: must be a string or array.`;
+    }
+  }
+
+  return null;
+}
+
+function buildChatApiRequest(payload) {
+  const upstreamPayload = { ...payload };
+  const agentId = payload.agentId?.trim() || CHAT_API_DEFAULT_AGENT_ID;
+  const sessionKey = payload.sessionKey?.trim() || "";
+
+  delete upstreamPayload.agentId;
+  delete upstreamPayload.sessionKey;
+
+  if (!upstreamPayload.model?.trim()) {
+    upstreamPayload.model = CHAT_API_DEFAULT_MODEL;
+  }
+  if (upstreamPayload.stream === undefined) {
+    upstreamPayload.stream = false;
+  }
+
+  return {
+    upstreamPayload,
+    agentId,
+    sessionKey,
+  };
+}
+
+function copyChatApiHeaders(upstream, res) {
+  const headersToCopy = [
+    "content-type",
+    "cache-control",
+    "x-openclaw-session-key",
+  ];
+
+  for (const header of headersToCopy) {
+    const value = upstream.headers.get(header);
+    if (value) {
+      res.setHeader(header, value);
+    }
+  }
+}
+
+function isBlockedPublicGatewayPath(pathname) {
+  return pathname === "/v1" || pathname.startsWith("/v1/") || pathname === "/tools/invoke";
 }
 
 const app = express();
@@ -892,6 +1044,78 @@ function validatePayload(payload) {
   return null;
 }
 
+app.post("/api/chat", requireChatApiAuth, async (req, res) => {
+  try {
+    if (!isConfigured()) {
+      return res.status(503).json({
+        error: { message: "OpenClaw is not configured yet." },
+      });
+    }
+
+    const payload = req.body || {};
+    const validationError = validateChatApiPayload(payload);
+    if (validationError) {
+      return res.status(400).json({
+        error: { message: validationError },
+      });
+    }
+
+    await ensureGatewayRunning();
+
+    const { upstreamPayload, agentId, sessionKey } = buildChatApiRequest(payload);
+    const headers = {
+      Authorization: `Bearer ${OPENCLAW_GATEWAY_TOKEN}`,
+      "Content-Type": "application/json",
+      Accept: upstreamPayload.stream ? "text/event-stream" : "application/json",
+      "x-openclaw-agent-id": agentId,
+    };
+    if (sessionKey) {
+      headers["x-openclaw-session-key"] = sessionKey;
+    }
+
+    log.info(
+      "chat-api",
+      `proxying /api/chat request stream=${Boolean(upstreamPayload.stream)} agent=${agentId}`,
+    );
+
+    const upstream = await fetch(`${GATEWAY_TARGET}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(upstreamPayload),
+    });
+
+    res.status(upstream.status);
+    copyChatApiHeaders(upstream, res);
+
+    if (!upstream.body) {
+      return res.end();
+    }
+
+    const bodyStream = Readable.fromWeb(upstream.body);
+    bodyStream.on("error", (err) => {
+      log.error("chat-api", `upstream stream error: ${err.message}`);
+      if (!res.headersSent) {
+        res.status(502).json({
+          error: { message: "Failed to read upstream chat response." },
+        });
+      } else {
+        res.end();
+      }
+    });
+
+    req.on("close", () => {
+      bodyStream.destroy();
+    });
+
+    return bodyStream.pipe(res);
+  } catch (err) {
+    log.error("chat-api", `request failed: ${String(err)}`);
+    return res.status(502).json({
+      error: { message: "Failed to proxy chat request to OpenClaw." },
+    });
+  }
+});
+
 app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   try {
     if (isConfigured()) {
@@ -955,6 +1179,11 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         ]),
       );
       extra += `[config] gateway.trustedProxies exit=${proxiesResult.code}\n`;
+
+      if (CHAT_API_KEY) {
+        const chatApiResult = await syncChatCompletionsEndpoint();
+        extra += `[config] gateway.http.endpoints.chatCompletions.enabled=true exit=${chatApiResult.code}\n`;
+      }
 
       if (payload.model?.trim()) {
         extra += `[setup] Setting model to ${payload.model.trim()}...\n`;
@@ -1256,9 +1485,7 @@ function verifyTuiAuth(req) {
   const decoded = Buffer.from(encoded, "base64").toString("utf8");
   const idx = decoded.indexOf(":");
   const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
-  return crypto.timingSafeEqual(passwordHash, expectedHash);
+  return secretsEqual(password, SETUP_PASSWORD);
 }
 
 function createTuiWebSocketServer(httpServer) {
@@ -1421,6 +1648,10 @@ app.use(async (req, res) => {
     return res.sendFile(path.join(process.cwd(), "src", "public", "loading.html"));
   }
 
+  if (isBlockedPublicGatewayPath(req.path)) {
+    return res.status(404).type("text/plain").send("Not Found");
+  }
+
   if (!isConfigured() && !req.path.startsWith("/setup")) {
     return res.redirect("/setup");
   }
@@ -1465,6 +1696,10 @@ const server = app.listen(PORT, () => {
         if (dr.output) log.info("wrapper", dr.output);
       } catch (err) {
         log.warn("wrapper", `doctor --fix failed: ${err.message}`);
+      }
+      if (CHAT_API_KEY) {
+        const chatApiResult = await syncChatCompletionsEndpoint();
+        log.info("chat-api", `chatCompletions endpoint sync exit=${chatApiResult.code}`);
       }
       await ensureGatewayRunning();
     })().catch((err) => {
