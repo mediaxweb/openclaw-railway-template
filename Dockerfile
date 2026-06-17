@@ -1,4 +1,4 @@
-FROM node:22-bookworm
+FROM node:24-bookworm
 
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -17,7 +17,7 @@ RUN npm install -g openclaw@2026.4.10 clawhub@latest
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN corepack enable && pnpm install --prod
+RUN corepack enable && pnpm install --prod --frozen-lockfile
 
 COPY src ./src
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh

@@ -10,13 +10,11 @@
     "start": "node src/server.js",
     "lint": "node -c src/server.js"
   },
+  "packageManager": "pnpm@11.7.0",
   "dependencies": {
     "express": "^5.1.0",
     "http-proxy": "^1.18.1",
     "node-pty": "^1.0.0",
     "ws": "^8.18.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": ["node-pty"]
   }
 }
