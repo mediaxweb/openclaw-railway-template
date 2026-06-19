@@ -16,6 +16,7 @@
       status: 'Loading...',
       configured: false,
       openclawVersion: '',
+      currentModel: '',
       authGroups: [],
       selectedGroup: '',
       authChoices: [],
@@ -70,12 +71,21 @@
           const j = await this.httpJson('/setup/api/status');
           this.configured = j.configured;
           this.openclawVersion = j.openclawVersion || '';
+          this.currentModel = j.currentModel || '';
           this.tuiEnabled = j.tuiEnabled || false;
           this.status = j.configured ? 'Configured - open /openclaw' : 'Not configured - run setup below';
           this.authGroups = j.authGroups || [];
           if (this.authGroups.length > 0) {
-            this.selectedGroup = this.authGroups[0].value;
+            const provider = (this.currentModel.split('/')[0] || '').toLowerCase();
+            const providerAliases = { gemini: 'google' };
+            const providerGroup = providerAliases[provider] || provider;
+            const matchingGroup = this.authGroups.find(g => g.value === providerGroup);
+            const currentGroup = this.authGroups.find(g => g.value === this.selectedGroup);
+            this.selectedGroup = (matchingGroup || currentGroup || this.authGroups[0]).value;
             this.updateAuthChoices();
+          }
+          if (this.configured && this.currentModel && !this.model) {
+            this.model = this.currentModel;
           }
           if (j.channelsAddHelp && j.channelsAddHelp.indexOf('telegram') === -1) {
             this.log += '\nNote: this openclaw build does not list telegram in `channels add --help`. Telegram auto-add will be skipped.\n';
@@ -90,7 +100,8 @@
       updateAuthChoices() {
         const group = this.currentGroup;
         this.authChoices = (group && group.options) ? group.options : [];
-        if (this.authChoices.length > 0) {
+        const selectedStillValid = this.authChoices.some(o => o.value === this.selectedAuth);
+        if (this.authChoices.length > 0 && !selectedStillValid) {
           this.selectedAuth = this.authChoices[0].value;
         }
       },
@@ -134,6 +145,43 @@
           try { j = JSON.parse(text); } catch (_e) { j = { ok: false, output: text }; }
           this.log += (j.output || JSON.stringify(j, null, 2));
           await this.refreshStatus();
+        } catch (e) {
+          this.log += '\nError: ' + String(e) + '\n';
+        } finally {
+          this.loading = false;
+        }
+      },
+
+      async updateAiSettings() {
+        if (!this.authSecret.trim() && !this.model.trim()) {
+          alert('Enter a new API key/token, a new model, or both.');
+          return;
+        }
+
+        const payload = {
+          authChoice: this.selectedAuth,
+          authSecret: this.authSecret,
+          model: this.model
+        };
+
+        this.log = 'Updating AI settings...\n';
+        this.loading = true;
+
+        try {
+          const res = await fetch('/setup/api/ai-settings', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          const text = await res.text();
+          let j;
+          try { j = JSON.parse(text); } catch (_e) { j = { ok: false, output: text }; }
+          this.log += (j.output || JSON.stringify(j, null, 2));
+          if (j.ok) {
+            this.authSecret = '';
+            await this.refreshStatus();
+          }
         } catch (e) {
           this.log += '\nError: ' + String(e) + '\n';
         } finally {
@@ -384,6 +432,48 @@
       <div class="card">
         <h2 class="card-title">Setup Complete</h2>
         <p class="text-muted text-sm">Your OpenClaw instance is configured and running</p>
+      </div>
+
+      <div class="card">
+        <h3 class="card-title" style="font-size:1rem">AI Settings</h3>
+        <p class="card-subtitle">Update provider credentials and default model</p>
+
+        <div class="form-group">
+          <label class="label">Provider Group</label>
+          <select x-model="selectedGroup" @change="updateAuthChoices()" class="select">
+            <template x-for="g in authGroups" :key="g.value">
+              <option :value="g.value" x-text="g.label + (g.hint ? ' - ' + g.hint : '')"></option>
+            </template>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label class="label">Auth Method</label>
+          <select x-model="selectedAuth" class="select">
+            <template x-for="o in authChoices" :key="o.value">
+              <option :value="o.value" x-text="o.label + (o.hint ? ' - ' + o.hint : '')"></option>
+            </template>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label class="label">New API Key / Token</label>
+          <input x-model="authSecret" type="password" placeholder="Leave blank to keep current key" class="input" />
+        </div>
+
+        <div class="form-group">
+          <label class="label">Default Model</label>
+          <input x-model="model" type="text" placeholder="e.g. openai/gpt-4.1-mini, anthropic/claude-sonnet-4" class="input" />
+          <p class="form-hint" x-show="currentModel">Current: <span x-text="currentModel"></span></p>
+        </div>
+
+        <button @click="updateAiSettings()" :disabled="loading" class="btn btn-primary">
+          <span x-show="!loading">Save AI Settings</span>
+          <span x-show="loading" style="display:inline-flex;align-items:center;gap:0.5rem">
+            <svg class="spinner-inline" fill="none" viewBox="0 0 24 24"><circle style="opacity:0.25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path style="opacity:0.75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+            Saving...
+          </span>
+        </button>
       </div>
 
       <div class="card">

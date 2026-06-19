@@ -160,7 +160,9 @@ A: New browsers/devices need a one-time approval from the gateway. Go to `/setup
 
 **Q: How do I change the AI model after setup?**
 
-A: Use the OpenClaw CLI to switch models. Access the web terminal at `/tui` (if enabled) or SSH into your container and run:
+A: Go to `/setup`, open the **AI Settings** card, enter a new default model, and click **Save AI Settings**. You can also paste a new provider API key/token there without resetting setup.
+
+If you prefer the CLI, access the web terminal at `/tui` (if enabled) or SSH into your container and run:
 
 ```bash
 openclaw models set provider/model-id
