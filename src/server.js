@@ -619,7 +619,6 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
 
 app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
   const { version, channelsHelp } = await getOpenclawInfo();
-  const currentModel = await getCurrentModel();
 
   const authGroups = [
     {
@@ -853,7 +852,6 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
     gatewayTarget: GATEWAY_TARGET,
     openclawVersion: version,
     channelsAddHelp: channelsHelp,
-    currentModel,
     authGroups,
     tuiEnabled: ENABLE_WEB_TUI,
   });
@@ -948,12 +946,10 @@ function buildOnboardArgs(payload) {
 
 function runCmd(cmd, args, opts = {}) {
   return new Promise((resolve) => {
-    const { input, ...spawnOpts } = opts;
     const proc = childProcess.spawn(cmd, args, {
-      ...spawnOpts,
+      ...opts,
       env: {
         ...process.env,
-        ...(spawnOpts.env || {}),
         OPENCLAW_STATE_DIR: STATE_DIR,
         OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
       },
@@ -963,12 +959,6 @@ function runCmd(cmd, args, opts = {}) {
     proc.stdout?.on("data", (d) => (out += d.toString("utf8")));
     proc.stderr?.on("data", (d) => (out += d.toString("utf8")));
 
-    if (input !== undefined) {
-      proc.stdin?.end(input);
-    } else {
-      proc.stdin?.end();
-    }
-
     proc.on("error", (err) => {
       out += `\n[spawn error] ${String(err)}\n`;
       resolve({ code: 127, output: out });
@@ -976,61 +966,6 @@ function runCmd(cmd, args, opts = {}) {
 
     proc.on("close", (code) => resolve({ code: code ?? 0, output: out }));
   });
-}
-
-const TOKEN_AUTH_PROVIDER_BY_CHOICE = {
-  apiKey: "anthropic",
-  "openai-api-key": "openai",
-  "gemini-api-key": "google",
-  "deepseek-api-key": "deepseek",
-  "openrouter-api-key": "openrouter",
-  "xai-api-key": "xai",
-  "mistral-api-key": "mistral",
-  "together-api-key": "together",
-  "huggingface-api-key": "huggingface",
-  "moonshot-api-key": "moonshot",
-  "moonshot-api-key-cn": "moonshot",
-  "kimi-code-api-key": "kimi-code",
-  "minimax-global-api": "minimax",
-  "minimax-cn-api": "minimax",
-  "zai-api-key": "zai",
-  "modelstudio-api-key": "modelstudio",
-  "modelstudio-api-key-cn": "modelstudio",
-  "modelstudio-standard-api-key": "modelstudio",
-  "modelstudio-standard-api-key-cn": "modelstudio",
-  "venice-api-key": "venice",
-  "chutes-api-key": "chutes",
-  "kilocode-api-key": "kilocode",
-  "xiaomi-api-key": "xiaomi",
-  "volcengine-api-key": "volcengine",
-  "byteplus-api-key": "byteplus",
-  "qianfan-api-key": "qianfan",
-  "ai-gateway-api-key": "ai-gateway",
-  "cloudflare-ai-gateway-api-key": "cloudflare-ai-gateway",
-  "litellm-api-key": "litellm",
-  "opencode-zen": "opencode-zen",
-  "opencode-go": "opencode-go",
-  "synthetic-api-key": "synthetic",
-  "custom-api-key": "custom",
-};
-
-function providerForAuthChoice(authChoice) {
-  return TOKEN_AUTH_PROVIDER_BY_CHOICE[authChoice] || null;
-}
-
-async function getCurrentModel() {
-  if (!isConfigured()) return "";
-
-  const result = await runCmd(
-    OPENCLAW_NODE,
-    clawArgs(["config", "get", "agents.defaults.model.primary"]),
-  );
-  if (result.code !== 0) {
-    log.warn("models", `current model lookup failed (exit=${result.code})`);
-    return "";
-  }
-
-  return result.output.trim();
 }
 
 const VALID_AUTH_CHOICES = [
@@ -1108,105 +1043,6 @@ function validatePayload(payload) {
   }
   return null;
 }
-
-app.post("/setup/api/ai-settings", requireSetupAuth, async (req, res) => {
-  try {
-    if (!isConfigured()) {
-      return res.status(400).json({
-        ok: false,
-        output: "OpenClaw is not configured yet. Run setup first.",
-      });
-    }
-
-    const payload = req.body || {};
-    const validationError = validatePayload(payload);
-    if (validationError) {
-      return res.status(400).json({ ok: false, output: validationError });
-    }
-
-    const authChoice = (payload.authChoice || "").trim();
-    const authSecret = (payload.authSecret || "").trim();
-    const model = (payload.model || "").trim();
-
-    if (!authSecret && !model) {
-      return res.status(400).json({
-        ok: false,
-        output: "Enter a new API key/token, a new model, or both.",
-      });
-    }
-
-    let ok = true;
-    let output = "[ai-settings] Updating AI settings...\n";
-    let changed = false;
-
-    if (authSecret) {
-      const provider = providerForAuthChoice(authChoice);
-      if (!provider) {
-        return res.status(400).json({
-          ok: false,
-          output:
-            "The selected auth method cannot be updated with an API key from this UI. Choose an API-key auth method.",
-        });
-      }
-
-      const profileId = `${provider}:setup-ui`;
-      const authResult = await runCmd(
-        OPENCLAW_NODE,
-        clawArgs([
-          "models",
-          "auth",
-          "paste-token",
-          "--provider",
-          provider,
-          "--profile-id",
-          profileId,
-        ]),
-        { input: `${authSecret}\n` },
-      );
-
-      changed = true;
-      if (authResult.code === 0) {
-        output += `[auth] Updated API key profile ${profileId}\n`;
-      } else {
-        ok = false;
-        output += `[auth] Failed to update API key profile ${profileId} (exit=${authResult.code}). Raw command output was hidden to avoid exposing the token.\n`;
-      }
-    }
-
-    if (model) {
-      const modelResult = await runCmd(
-        OPENCLAW_NODE,
-        clawArgs(["models", "set", model]),
-      );
-      changed = true;
-      if (modelResult.code === 0) {
-        output += `[models] Set default model to ${model}\n${modelResult.output || ""}`;
-      } else {
-        ok = false;
-        output += `[models] Failed to set default model to ${model} (exit=${modelResult.code})\n${modelResult.output || ""}`;
-      }
-    }
-
-    if (changed) {
-      output += "\n[ai-settings] Restarting gateway...\n";
-      try {
-        await restartGateway();
-        output += "[ai-settings] Gateway restarted.\n";
-      } catch (err) {
-        ok = false;
-        output += `[ai-settings] Gateway restart failed: ${err.message}\n`;
-      }
-    }
-
-    return res.status(ok ? 200 : 500).json({ ok, output });
-  } catch (err) {
-    log.error("setup", `ai settings error: ${String(err)}`);
-    return res.status(500).json({
-      ok: false,
-      output: `Internal error: ${String(err)}`,
-    });
-  }
-});
 
 app.post("/api/chat", requireChatApiAuth, async (req, res) => {
   try {
